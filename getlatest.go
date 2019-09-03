@@ -41,6 +41,9 @@ import (
 	"time"
 
 	"github.com/ghodss/yaml"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type getter struct {
@@ -55,6 +58,8 @@ type getter struct {
 	urlt        *template.Template
 	ttl         time.Duration
 	lastSuccess time.Time
+	failGauge   prometheus.Gauge
+	failSince   time.Time
 }
 
 const defaultConfigPath = "/etc/getlatest.yaml"
@@ -64,6 +69,7 @@ func main() {
 
 	installService := flag.Bool("install-service", false, "install systemd service")
 	configPath := flag.String("config", defaultConfigPath, "configuration `file`")
+	metrics := flag.String("metrics", ":", "serve metrics at http://`[address]:port`/metrics")
 	flag.Parse()
 	if *installService {
 		err := ioutil.WriteFile("/lib/systemd/system/getlatest.service", systemdUnitFile, 0666)
@@ -83,6 +89,9 @@ func main() {
 		}
 		return
 	}
+
+	http.Handle("/metrics", promhttp.Handler())
+	go http.ListenAndServe(*metrics, nil)
 
 	var getters map[string]*getter
 	buf, err := ioutil.ReadFile(*configPath)
@@ -150,6 +159,14 @@ func (g *getter) setup() error {
 	if g.Weekdays = strings.TrimSpace(g.Weekdays); g.Weekdays != "" {
 		g.Weekdays = " " + strings.ToLower(g.Weekdays)
 	}
+
+	if fg, err := failGaugeVec.GetMetricWithLabelValues(g.Output); err != nil {
+		return err
+	} else {
+		fg.Set(0)
+		g.failGauge = fg
+	}
+
 	return nil
 }
 
@@ -181,51 +198,58 @@ func (g *getter) download() {
 	if !g.should(time.Now()) {
 		return
 	}
+	err := g.trydownload()
+	if err != nil {
+		if g.failSince.IsZero() {
+			g.failSince = time.Now()
+		}
+		log.Print(err)
+		g.failGauge.Set(time.Now().Sub(g.failSince).Seconds())
+	} else {
+		g.failSince = time.Time{}
+		g.failGauge.Set(0)
+	}
+}
+
+func (g *getter) trydownload() error {
 	url, err := g.url()
 	if err != nil {
-		log.Printf("%q: error getting url: %s", g.Output, err)
-		return
+		return fmt.Errorf("%q: error getting url: %s", g.Output, err)
 	}
 	log.Printf("%q: downloading %q", g.Output, url)
 	outdir, outfile := filepath.Split(g.Output)
 	f, err := ioutil.TempFile(outdir, "."+outfile+".")
 	if err != nil {
-		log.Printf("%q: error creating tempfile: %s", g.Output, err)
-		return
+		return fmt.Errorf("%q: error creating tempfile: %s", g.Output, err)
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
 
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Printf("%q: %q: %s", g.Output, url, err)
-		return
+		return fmt.Errorf("%q: %q: %s", g.Output, url, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("%q: %q: non-OK response: %d %q", g.Output, url, resp.StatusCode, resp.Status)
-		return
+		return fmt.Errorf("%q: %q: non-OK response: %d %q", g.Output, url, resp.StatusCode, resp.Status)
 	}
 	n, err := io.Copy(f, resp.Body)
 	if err != nil {
-		log.Printf("%q: downloading %q to tempfile: %s", g.Output, url, err)
-		return
+		return fmt.Errorf("%q: downloading %q to tempfile: %s", g.Output, url, err)
 	}
 	if n < g.MinimumSize {
-		log.Printf("%q: response body too small: %d bytes < MinimumSize %d", g.Output, n, g.MinimumSize)
-		return
+		return fmt.Errorf("%q: response body too small: %d bytes < MinimumSize %d", g.Output, n, g.MinimumSize)
 	}
 	err = f.Close()
 	if err != nil {
-		log.Printf("%q: writing tempfile: %s", g.Output, err)
-		return
+		return fmt.Errorf("%q: writing tempfile: %s", g.Output, err)
 	}
 	err = os.Rename(f.Name(), g.Output)
 	if err != nil {
-		log.Printf("%q: renaming tempfile: %s", g.Output, err)
-		return
+		return fmt.Errorf("%q: renaming tempfile: %s", g.Output, err)
 	}
 	g.lastSuccess = time.Now()
 	log.Printf("%q: success, wrote %d bytes", g.Output, n)
+	return nil
 }
 
 var systemdUnitFile = []byte(`
@@ -245,3 +269,8 @@ SyslogIdentifier=getlatest
 [Install]
 WantedBy=multi-user.target
 `)
+
+var failGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "getlatest_failing_seconds",
+	Help: "consecutive seconds of failures",
+}, []string{"target"})
