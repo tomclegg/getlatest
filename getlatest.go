@@ -38,6 +38,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ghodss/yaml"
@@ -64,6 +65,12 @@ type getter struct {
 }
 
 const defaultConfigPath = "/etc/getlatest.yaml"
+
+var umask = func() os.FileMode {
+	umask := syscall.Umask(0)
+	syscall.Umask(umask)
+	return os.FileMode(umask)
+}()
 
 func main() {
 	log.SetFlags(0)
@@ -250,6 +257,11 @@ func (g *getter) trydownload() error {
 	err = f.Close()
 	if err != nil {
 		return fmt.Errorf("%q: writing tempfile: %s", g.Output, err)
+	}
+	mode := 0666 & ^umask
+	err = os.Chmod(f.Name(), mode)
+	if err != nil {
+		return fmt.Errorf("%q: chmod %o tempfile: %s", g.Output, mode, err)
 	}
 	err = os.Rename(f.Name(), g.Output)
 	if err != nil {
