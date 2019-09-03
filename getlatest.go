@@ -58,6 +58,7 @@ type getter struct {
 	urlt        *template.Template
 	ttl         time.Duration
 	lastSuccess time.Time
+	failCount   prometheus.Counter
 	failGauge   prometheus.Gauge
 	failSince   time.Time
 }
@@ -166,6 +167,12 @@ func (g *getter) setup() error {
 		fg.Set(0)
 		g.failGauge = fg
 	}
+	if fc, err := failCountVec.GetMetricWithLabelValues(g.Output); err != nil {
+		return err
+	} else {
+		fc.Add(0)
+		g.failCount = fc
+	}
 
 	return nil
 }
@@ -205,6 +212,7 @@ func (g *getter) download() {
 		}
 		log.Print(err)
 		g.failGauge.Set(time.Now().Sub(g.failSince).Seconds())
+		g.failCount.Inc()
 	} else {
 		g.failSince = time.Time{}
 		g.failGauge.Set(0)
@@ -270,7 +278,13 @@ SyslogIdentifier=getlatest
 WantedBy=multi-user.target
 `)
 
-var failGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "getlatest_failing_seconds",
-	Help: "consecutive seconds of failures",
-}, []string{"target"})
+var (
+	failGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "getlatest_failing_seconds",
+		Help: "consecutive seconds of failures",
+	}, []string{"target"})
+	failCountVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "getlatest_failures",
+		Help: "number of failed attempts",
+	}, []string{"target"})
+)
